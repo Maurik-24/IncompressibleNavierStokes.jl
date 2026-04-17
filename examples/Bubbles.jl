@@ -23,9 +23,10 @@ getparams() = (;
     # Flow
     viscosity = 5.0e-4,
     lidvelocity = 1.0,
-    # dens = (1.0e3, 1.25),
-    # grav = (0.0, 0.0, -9.81),
-    # visc = (1.0e-3, 1.8e-5),
+    gravity = (0.0, -9.81),
+    # densities = (; liquid = 1.0e3, gas = 1.25),
+    densities = (; liquid = 1.0, gas = 1e-3),
+    viscosities = (; liquid = 1.0e-3, gas = 1.8e-5),
 
     # Bubble
     bubble = (;
@@ -163,7 +164,8 @@ function masksegment(segment, rect)
 end
 
 "Interpolate surface tension force at markers to velocity points."
-function interpolate_tension!(Fu, bub_F, bub_x, setup)
+function interpolate_tension!(Fu, bub_F, bub_x, fractions, setup)
+    (; densities) = getparams()
     (; Δ, Iu) = setup
     xu = setup.x[1][2:end], setup.x[2][2:end]
     npoint = length(bub_x)
@@ -233,10 +235,14 @@ function interpolate_tension!(Fu, bub_F, bub_x, setup)
             FuI += contribution
         end
 
+        # Density in current point
+        a = (fractions[I] + fractions[right(I, dim, 1)]) / 2 # Interpolate to velocity point
+        dens = (1 - a) * densities.liquid + a * densities.gas
+
         # Now write the total contribution from all markers to the current velocity point.
         # Add to existing force (convection-diffusion etc.).
         # Also normalize by the current grid spacing, since all the integrals are weighed by marker lengths
-        Fu[I, dim] += FuI / Δ[otherdim][I[otherdim]]
+        Fu[I, dim] += FuI / Δ[otherdim][I[otherdim]] / dens
 
         return nothing
     end
@@ -434,6 +440,39 @@ function edgecenters(points)
     return centers
 end
 
+function convectiondiffusion_nonconstant!(f, u, fractions, setup)
+    (; Iu) = setup
+    (; viscosities, densities) = getparams()
+    AK.foreachindex(f) do ilin
+        II = CartesianIndices(f)[ilin]
+        i, j, dim = II.I
+        I = CartesianIndex(i, j)
+        I in Iu[dim] || return nothing
+        conv =
+            NS.tensordivergence(setup, NS.convstress, (setup, u), dim, 1, I) +
+            NS.tensordivergence(setup, NS.convstress, (setup, u), dim, 2, I)
+        diff =
+            NS.tensordivergence(setup, NS.diffstress, (setup, u, 1.0), dim, 1, I) +
+            NS.tensordivergence(setup, NS.diffstress, (setup, u, 1.0), dim, 2, I)
+        a = (fractions[I] + fractions[right(I, dim, 1)]) / 2 # Interpolate to velocity point
+        dens = (1 - a) * densities.liquid + a * densities.gas
+        visc = dens / ((1 - a) * densities.liquid / viscosities.liquid + a * densities.gas / viscosities.gas)
+        # visc = viscosity
+        f[II] += conv + visc * diff
+        return nothing
+    end
+    return nothing
+end
+
+function applygravity!(f, setup)
+    gravity = getparams()
+    AK.foreachindex(f) do ilin
+        II = CartesianIndices(f)[ilin]
+        dim = II.I[3]
+        f[II] += gravity[dim]
+    end
+end
+
 """
 Perform one time step for the total state `U = (; u, x)`, where
 `u` is the velocity field and `x` are the control points defining the bubble.
@@ -441,7 +480,7 @@ Wray's low-storage RK3 method is used, which only relies on two
 temporary registers `F` and `U0` (same size as `U`).
 In addition, we need a pressure register `p` and a surface tension register `tension`.
 """
-function rk3step!(F, U0, U, t, dt, tension, p, psolver, viscosity, setup)
+function rk3step!(F, U0, U, t, dt, fractions, tension, p, psolver, viscosity, setup)
     # RK coefficients
     a = 8 / 15, 5 / 12, 3 / 4
     b = 1 / 4, 0.0
@@ -455,16 +494,21 @@ function rk3step!(F, U0, U, t, dt, tension, p, psolver, viscosity, setup)
     # RK3 substeps
     for i in 1:nstage
         # Apply right-hand side function to current state U, put in F
+        compute_fractions!(fractions, U.x, U.xcenter, setup) # Current phase fractions
         fill!(F.u, 0) # Initialize with 0
-        NS.convectiondiffusion!(F.u, U.u, setup, viscosity) # This adds to existing force
-        surfacetension!(tension, U.x) # This allocates a new array for now
-        interpolate_tension!(F.u, tension, U.x, setup) # Add surface tension to existing force
+        # NS.convectiondiffusion!(F.u, U.u, setup, viscosity) # This adds to existing force
+        convectiondiffusion_nonconstant!(F.u, U.u, fractions, setup) # This adds to existing force
+        surfacetension!(tension, U.x)
+        interpolate_tension!(F.u, tension, U.x, fractions, setup) # Add surface tension to existing force
+        applygravity!(F.u, setup)
         interpolate_velocity!(F.x, U.x, U.u, setup) # Interpolate velocity to control points
+        interpolate_velocity!(F.xcenter, U.xcenter, U.u, setup) # Interpolate velocity to bubble center
 
         # Evolve U
         t = t0 + c[i] * dt
         @. U.u = U0.u + a[i] * dt * F.u
         @. U.x = U0.x + a[i] * dt * F.x
+        @. U.xcenter = U0.xcenter + a[i] * dt * F.xcenter
         NS.apply_bc_u!(U.u, t, setup)
         NS.project!(U.u, setup; psolver, p)
 
@@ -473,6 +517,7 @@ function rk3step!(F, U0, U, t, dt, tension, p, psolver, viscosity, setup)
         if i < nstage
             @. U0.u += b[i] * dt * F.u
             @. U0.x += b[i] * dt * F.x
+            @. U0.xcenter += b[i] * dt * F.xcenter
         end
 
         # Fill boundary values at new time
@@ -495,7 +540,6 @@ function plotstate(Uobs, setup)
     cpu = AK.KernelAbstractions.CPU()
 
     (; plotting, bubble) = getparams()
-    (; σ) = bubble
     (; step, lengthscale, plotsurfacetension) = plotting
 
     fig = Figure(; size)
@@ -534,6 +578,12 @@ function plotstate(Uobs, setup)
     end
     bubplot = scatterlines!(ax, pp; label = "Bubble surface")
 
+    # Plot bubble center
+    xxcenter = map(Uobs) do U
+        return map(Point2, U.xcenter)
+    end
+    scatter!(ax, xxcenter; color = Cycled(3))
+
     # Just do this manually for now, since there is an isssue with plotting `arrows2d` as a legend entry.
     leg_elems = [velocity_label, bubplot]
     leg_labels = ["Velocity", "Bubble surface"]
@@ -567,17 +617,18 @@ function plotstate(Uobs, setup)
     return fig
 end
 
-function solveandplot(u, x, setup, psolver)
+function solveandplot(u, x, xcenter, setup, psolver)
     params = getparams()
     (; viscosity, dt, nsubstep, nstep, animation) = params
     (; markerlims, angle_min) = params.bubble
 
     # Allocate registers
-    U = (; u, x) # Current state
+    U = (; u, x, xcenter) # Current state
     U0 = deepcopy(U) # RK3 accumulator for previous stages
     F = deepcopy(U) # RK3 right hand side
     tension = similar(x) # Surface tension at markers
     p = NS.scalarfield(setup) # Pressure
+    fractions = NS.scalarfield(setup) # Phase fractions (1.0 if inside bubble, 0.0 outside)
 
     # Create plot
     Uobs = Observable(U)
@@ -593,7 +644,7 @@ function solveandplot(u, x, setup, psolver)
     for itime in 1:nstep
         for isub in 1:nsubstep
             # Perform one RK3 step of step size `dt`
-            rk3step!(F, U0, U, t, dt, tension, p, psolver, viscosity, setup)
+            rk3step!(F, U0, U, t, dt, fractions, tension, p, psolver, viscosity, setup)
             t += dt
 
             # Remesh the bubble.
@@ -602,9 +653,9 @@ function solveandplot(u, x, setup, psolver)
             # TODO: Remesh without too much reallocation? (for heavy 3D triangulations)
             # TODO: Maybe only do this every `nremesh` steps? (for heavy 3D triangulations)
             x = remesh(U.x, markerlims, angle_min)
-            U = (; U.u, x)
-            U0 = (; U0.u, x = zero(x))
-            F = (; F.u, x = zero(x))
+            U = (; U.u, x, U.xcenter)
+            U0 = (; U0.u, x = zero(x), U0.xcenter)
+            F = (; F.u, x = zero(x), F.xcenter)
             tension = similar(x)
 
             # @info "itime = $itime / $nstep, isub = $isub / $nsubstep, t = $(round(t, digits = 4))" # maximum(abs, U.u)
@@ -627,6 +678,8 @@ end
 """
 Create a circular bubble centered at `center` with radius `radius`,
 discretized by `npoint` control points.
+The center point is also returned,
+in the same format as the marker control points (vector of points).
 """
 function bubble()
     (; center, radius, npoint) = getparams().bubble
@@ -637,7 +690,9 @@ function bubble()
         y = y0 + radius * sin(angle)
         return MyPoint(x, y)
     end
-    return adapt(getbackend(), b)
+    bdev = adapt(getbackend(), b)
+    xcenterdev = adapt(getbackend(), [MyPoint(center...)]) # This is an array containing a single point
+    return bdev, xcenterdev
 end
 
 "Make illustration plot of the rectangular segment masking procedure."
@@ -705,6 +760,98 @@ function illustrate_masking()
     fig
 end
 
+"""
+Return `true` if `point` is inside the bubble.
+This is determined by whether the number of intersections of the segment `point`-`xcenter` is odd or even with the marker segments.
+`point` and `xcenter` are `MyPoint`s, while `x` is a vector of `MyPoint`s.
+"""
+function check_if_inside(point, x, xcenter, setup)
+    # Count intersections of the segment (point → xcenter) with the bubble boundary.
+    # Since xcenter is inside, an even count (incl. 0) means point is also inside.
+    n = length(x)
+    crossings = 0
+    px, py = point[1], point[2]
+    qx, qy = xcenter[1], xcenter[2]
+    for i in 1:n
+        a = x[i]
+        b = x[mod1(i + 1, n)]
+        ax, ay = a[1], a[2]
+        bx, by = b[1], b[2]
+
+        # Check if segments (p,q) and (a,b) intersect using cross-product method.
+        # Parameterize: P(t) = p + t*(q-p), Q(s) = a + s*(b-a)
+        # Solve for t and s; segments intersect iff 0 ≤ t ≤ 1 and 0 ≤ s ≤ 1.
+        dx_pq = qx - px
+        dy_pq = qy - py
+        dx_ab = bx - ax
+        dy_ab = by - ay
+
+        denom = dx_pq * dy_ab - dy_pq * dx_ab
+
+        dx_pa = ax - px
+        dy_pa = ay - py
+
+        t = (dx_pa * dy_ab - dy_pa * dx_ab) / denom
+        s = (dx_pa * dy_pq - dy_pa * dx_pq) / denom
+
+        # When denom == 0 (parallel), t and s become ±Inf or NaN,
+        # so the comparison naturally fails.
+        if 0 ≤ t ≤ 1 && 0 ≤ s ≤ 1
+            crossings += 1
+        end
+    end
+    return iseven(crossings)
+end
+
+function mark_inside_points!(setup, insidemarkers, x, xcenter)
+    (; xp) = setup
+    AK.foreachindex(insidemarkers) do index
+        I = CartesianIndices(insidemarkers)[index]
+        i, j = I.I
+        point = MyPoint(xp[1][i], xp[2][j])
+        insidemarkers[I] = check_if_inside(point, x, xcenter[1], setup)
+    end
+    return nothing
+end
+
+function compute_fractions!(fractions, x, xcenter, setup)
+    (; xp) = setup
+    xu = setup.x # Includes leftmost point
+    AK.foreachindex(fractions) do index
+        I = CartesianIndices(fractions)[index]
+        i, j = I.I
+        ninside = 0
+        for dj in (0, 1), di in (0, 1)
+            point = MyPoint(xu[1][i + di], xu[2][j + dj])
+            ninside += check_if_inside(point, x, xcenter[1], setup)
+        end
+        fractions[I] = ninside / 4 # 1.0 if all corners inside, 0.0 if all corners outside
+    end
+    return nothing
+end
+
+function plot_insidemarkers(u, x, xcenter, setup)
+    insidemarkers = similar(NS.scalarfield(setup), Bool)
+    mark_inside_points!(setup, insidemarkers, x, xcenter)
+    fig = Figure()
+    ax = Axis(fig[1, 1])
+    heatmap!(ax, setup.xp..., insidemarkers)
+    scatterlines!(ax, map(Point2, x))
+    scatter!(ax, map(Point2, xcenter); color = Cycled(3))
+    return fig
+end
+
+function plot_fractions(u, x, xcenter, setup)
+    fractions = NS.scalarfield(setup)
+    compute_fractions!(fractions, x, xcenter, setup)
+    fig = Figure()
+    ax = Axis(fig[1, 1])
+    heatmap!(ax, setup.xp..., fractions)
+    scatterlines!(ax, map(Point2, x))
+    scatter!(ax, map(Point2, xcenter); color = Cycled(3))
+    return fig
+end
+
 end
 
 Bubbles.illustrate_masking()
@@ -714,10 +861,15 @@ setup = Bubbles.lidsetup()
 
 psolver = Bubbles.NS.default_psolver(setup)
 u = Bubbles.NS.velocityfield(setup, (dim, x, y) -> zero(x));
-x = Bubbles.bubble()
+x, xcenter = Bubbles.bubble()
 
 # Solve
-(; u, x) = Bubbles.solveandplot(u, x, setup, psolver)
+(; u, x, xcenter) = Bubbles.solveandplot(u, x, xcenter, setup, psolver)
+
+Bubbles.plotstate(Observable((; u, x, xcenter)), setup)
+
+Bubbles.plot_insidemarkers(u, x, xcenter, setup) |> display
+Bubbles.plot_fractions(u, x, xcenter, setup) |> display
 
 # Compute integral of surface tension (it should be zero)
 false && let
