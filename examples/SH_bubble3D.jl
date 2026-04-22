@@ -1,3 +1,19 @@
+"""
+Functionality for dynamically representing bubbles using a linear combination of spherical harmonics as basis functions, and a centroid position.
+The basis function coefficients and the bubble centroid are updated by a given fluid velocity field. Two prescribed velocity fields are included as test cases.
+
+Current functionality inludes:
+    - Evaluating spherical harmonics and their partial derivatives at given points 
+    - Using spherical design cubature rules to efficiently numerically integrate integrals over the unit sphere
+    - RK4 time stepping to update the bubble centroid position and shape coefficients
+    - Simple bubble visualization using a Makie scatter plot 
+
+To be implemented:
+    - Computation of surface tension forces at given positions on the bubble surface
+    - Numerical integration over a given part of the bubble surface
+    - Bubble visualization as a closed surface, also over time
+"""
+
 using SphericalHarmonics, SphericalHarmonicModes
 using DelimitedFiles
 using Makie, GLMakie
@@ -196,6 +212,10 @@ npoints = 1059
 r, ϕ, θ = get_points_spc(npoints)
 r_test, ϕ_test, θ_test = get_points_spc(16382)  # for testing only
 
+println(findall(t -> abs.(t) < 1e-12, cos.(θ)))
+println(findall(t -> abs.(t) < 1e-12, θ_test))
+# print(θ/π)
+
 # Prescribed velocity field:
 uzmax = [0., 0., 1.]        # max velocity in z direction 
 uxmax = [1. / 3., 0., 0.]   # max velocity in x direction
@@ -218,10 +238,10 @@ Y_test = get_SH(ℓₘ, ϕ_test, θ_test)                         # spherical ha
 
 ### Comment/uncomment x vs y test case #############################################################################################################
 # Parabolic velocity profile in z direction:
-x0, y0, z0, x, y, z = parabolic_z(c0, centr0, Y, dY_dϕ, ϕ, θ, uz, uzmax, npoints, V, dt, nt, Y_test, ϕ_test, θ_test)
+# x0, y0, z0, x, y, z = parabolic_z(c0, centr0, Y, dY_dϕ, ϕ, θ, uz, uzmax, npoints, V, dt, nt, Y_test, ϕ_test, θ_test)
 
 # Linear velocity profile in x direction:
-# x0, y0, z0, x, y, z = linear_x(c0, centr0, Y, dY_dϕ, dY_dθ, ϕ, θ, ux, uxmax, npoints, V, dt, nt, Y_test, ϕ_test, θ_test, ℓs, ms, one, mone)
+x0, y0, z0, x, y, z = linear_x(c0, centr0, Y, dY_dϕ, dY_dθ, ϕ, θ, ux, uxmax, npoints, V, dt, nt, Y_test, ϕ_test, θ_test, ℓs, ms, one, mone)
 ####################################################################################################################################################
 
-scatter(x, y, z)
+# scatter(x, y, z)
